@@ -6,11 +6,14 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import GUI from 'lil-gui';
 
 const MODELO = './casa.glb';      // archivo por defecto (junto a index.html)
 const PREFIJO = 'foco';           // objetos de luz que empiezan con este nombre
 const MAX_LUCES_REALES = 6;       // luces reales que iluminan la fachada
+const LS = 'casa-luces-borrador';
+const PUEDE_EDITAR = /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname) || location.search.includes('editar');
 const MOVIL = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
 
 // ---------- Escena base ----------
@@ -46,15 +49,31 @@ luna.shadow.bias = -0.0004;
 luna.shadow.normalBias = 0.08;
 scene.add(hemi, luna, luna.target);
 const sol = { centro: new THREE.Vector3(), r: 20 };
+const CL = { noche: new THREE.Color(0x05070d), dia: new THREE.Color(0x86b4ea), dusk: new THREE.Color(0xff8a50),
+  hNoche: new THREE.Color(0x405080), hDia: new THREE.Color(0xbcd6ff), sNoche: new THREE.Color(0x0c1018), sDia: new THREE.Color(0x56644c), solC: new THREE.Color(0xfff2dc) };
+const ss = (x, a, b) => THREE.MathUtils.smoothstep(x, a, b);
+let lampara = 1;   // 1 = focos encendidos, 0 = apagados (de día)
 function aplicarLuna() {
-  const az = THREE.MathUtils.degToRad(params.azimut), el = THREE.MathUtils.degToRad(params.elevacion);
+  const alt = Math.sin((params.hora - 6) / 24 * Math.PI * 2);   // -1 noche profunda ... 1 mediodía
+  const dia = ss(alt, -0.15, 0.35), arriba = alt > 0;
+  const az = THREE.MathUtils.degToRad(arriba ? params.azimut + (params.hora - 12) * 15 : params.azimut);
+  const el = THREE.MathUtils.degToRad(arriba ? Math.max(5, alt * 70) : params.elevacion);
   const d = new THREE.Vector3(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
   luna.position.copy(sol.centro).addScaledVector(d, sol.r * 1.5);
   luna.target.position.copy(sol.centro);
   const c = luna.shadow.camera, h = sol.r * 0.55;
   c.left = -h; c.right = h; c.top = h; c.bottom = -h; c.near = 0.5; c.far = sol.r * 4;
   c.updateProjectionMatrix();
-  luna.color.set(params.colorLuna); luna.intensity = params.luna; luna.castShadow = params.sombras;
+  if (arriba) { luna.color.copy(CL.solC).lerp(CL.dusk, 1 - ss(alt, 0, 0.35)); luna.intensity = 3 * ss(alt, 0, 0.3); }
+  else { luna.color.set(params.colorLuna); luna.intensity = params.luna * ss(-alt, 0, 0.3); }
+  luna.castShadow = params.sombras && luna.intensity > 0.05;
+  scene.background.copy(CL.noche).lerp(CL.dia, dia).lerp(CL.dusk, Math.exp(-((alt / 0.14) ** 2)) * 0.3);
+  scene.fog.color.copy(scene.background);
+  hemi.color.copy(CL.hNoche).lerp(CL.hDia, dia);
+  hemi.intensity = THREE.MathUtils.lerp(params.ambiente, 1.0, dia);
+  suelo.material.color.copy(CL.sNoche).lerp(CL.sDia, dia);
+  lampara = 1 - ss(alt, -0.05, 0.3);
+  renderer.toneMappingExposure = params.exposicion * THREE.MathUtils.lerp(1, 0.8, dia);
 }
 
 const suelo = new THREE.Mesh(new THREE.CircleGeometry(80, 48),
@@ -101,16 +120,16 @@ function nivel(g, i, t) {
 
 // ---------- Extracción de luces ----------
 let grupos = [], bulbs, halos, haloCol, gui, reales = [];
-const params = { bloom: 0.9, exposicion: 1, ambiente: 0.25, luna: 1.8, colorLuna: '#9db4ff', azimut: 70, elevacion: 45, sombras: true, calidad: 'media', autoCalidad: true, bloomOn: true, halo: 0.9, brillo: 3, lucesReales: true, luzFachada: 15 };
+const params = { bloom: 0.9, exposicion: 1, ambiente: 0.25, luna: 1.8, colorLuna: '#9db4ff', azimut: 70, elevacion: 45, sombras: true, modo: 'noche', hora: 0, duracion: 60, calidad: 'media', autoCalidad: true, bloomOn: true, halo: 0.9, brillo: 3, lucesReales: true, luzFachada: 15 };
 
 function limpiar() {
   [...world.children].forEach(o => world.remove(o));
   [...fx.children].forEach(o => { o.geometry?.dispose(); fx.remove(o); });
-  grupos = []; reales = [];
+  grupos = []; reales = []; bulbs = halos = haloCol = null; sel = null; tc.detach();
   gui?.destroy();
 }
 
-function usarModelo(root) {
+function usarModelo(root, usarGuardado = false) {
   limpiar();
   const luces = [];
   root.traverse(o => { if (o.isLight) luces.push(o); });   // incluye el Sol de Blender, que llega con intensidad enorme
@@ -140,43 +159,12 @@ function usarModelo(root) {
   luces.forEach(l => l.removeFromParent());       // fuera luces reales del glTF
   world.add(root);
 
-  const filtrados = datos.filter(d => d.nombre.startsWith(PREFIJO));
-  const lista = filtrados.length ? filtrados : datos;
-  const mapa = new Map();
-  lista.forEach(d => {
-    const g = d.nombre.startsWith(PREFIJO) ? (d.nombre.split(/[_.]/)[1] || 'todos') : (d.nombre.replace(/[._ ]?\d+$/, '') || 'luces');   // foco_techo_01 -> techo; Spot.001 -> Spot
-    if (!mapa.has(g)) mapa.set(g, { nombre: g, idx: [], patron: 'fijo', vel: 1, inten: 1, color: '#' + d.color.getHexString() });
-    const gr = mapa.get(g); gr.idx.push(d); 
-  });
-  grupos = [...mapa.values()];
-
-  const total = lista.length;
-  if (total) {
-    bulbs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.06, 10, 8),
-      new THREE.MeshBasicMaterial(), total);
-    const posArr = new Float32Array(total * 3);
-    let k = 0;
-    grupos.forEach(g => g.idx.forEach(d => {
-      d.k = k; bulbs.setMatrixAt(k, new THREE.Matrix4().setPosition(d.pos));
-      d.pos.toArray(posArr, k * 3); k++;
-    }));
-    const hg = new THREE.BufferGeometry();
-    hg.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-    haloCol = new THREE.BufferAttribute(new Float32Array(total * 3), 3);
-    hg.setAttribute('aCol', haloCol);
-    halos = new THREE.Points(hg, haloMat);
-    halos.frustumCulled = false;
-    fx.add(bulbs, halos);
-    // luces reales: una por foco si son pocas; si no, una por grupo (en su centro)
-    const pocas = lista.length <= MAX_LUCES_REALES;
-    const fuentes = pocas
-      ? lista.map(d => ({ g: grupos.find(x => x.idx.includes(d)), ds: [d], pos: d.pos }))
-      : grupos.map(g => { const c = new THREE.Vector3(); g.idx.forEach(d => c.add(d.pos)); return { g, ds: g.idx, pos: c.divideScalar(g.idx.length) }; });
-    fuentes.slice(0, MAX_LUCES_REALES).forEach(f => {
-      const L = new THREE.PointLight(0xffffff, 0, 16, 2); L.position.copy(f.pos);
-      fx.add(L); reales.push({ ...f, L });
-    });
-  }
+  focos = (datos.some(d => d.nombre.startsWith(PREFIJO)) ? datos.filter(d => d.nombre.startsWith(PREFIJO)) : datos)
+    .map(d => ({ nombre: d.nombre, pos: d.pos, color: '#' + d.color.getHexString(), grupo: grupoDe(d.nombre) }));
+  ajustes = new Map();
+  if (usarGuardado && GUARDADO) aplicarGuardado(GUARDADO);
+  reconstruir();
+  const total = focos.length;
 
   // encuadrar cámara
   const box = new THREE.Box3().setFromObject(root);
@@ -194,18 +182,140 @@ function usarModelo(root) {
   msg(total ? `${total} focos en ${grupos.length} grupos` : 'No encontré luces (usa Point/Spot con nombre foco_grupo_01)');
 }
 
+// ---------- Focos editables ----------
+let focos = [], ajustes = new Map(), sel = null, GUARDADO = null, cXYZ = [], cHora;
+const edit = { activo: false }, campo = { nombre: '(toca un foco)', x: 0, y: 0, z: 0, grupo: '' };
+const proxy = new THREE.Object3D(); scene.add(proxy);
+const tc = new TransformControls(camera, renderer.domElement);
+tc.size = 0.8; scene.add(tc.getHelper());
+tc.addEventListener('dragging-changed', e => { controls.enabled = !e.value; if (!e.value) guardarBorrador(); });
+tc.addEventListener('objectChange', () => { if (sel) { sel.pos.copy(proxy.position); refrescar(sel); leerSel(); } });
+const grupoDe = n => n.startsWith(PREFIJO) ? (n.split(/[_.]/)[1] || 'todos') : (n.replace(/[._ ]?\d+$/, '') || 'luces');
+
+function posReal(r) {
+  const c = new THREE.Vector3(); r.ds.forEach(d => c.add(d.pos)); r.L.position.copy(c.divideScalar(r.ds.length));
+}
+function refrescar(f) {
+  bulbs.setMatrixAt(f.k, new THREE.Matrix4().setPosition(f.pos)); bulbs.instanceMatrix.needsUpdate = true;
+  const a = halos.geometry.attributes.position; a.setXYZ(f.k, f.pos.x, f.pos.y, f.pos.z); a.needsUpdate = true;
+  reales.forEach(r => { if (r.ds.includes(f)) posReal(r); });
+}
+function reconstruir() {
+  [...fx.children].forEach(o => { o.geometry?.dispose(); o.dispose?.(); fx.remove(o); });
+  bulbs = halos = haloCol = null; reales = []; seleccionar(null);
+  grupos = [...new Set(focos.map(f => f.grupo))].map(n => {
+    const lista = focos.filter(f => f.grupo === n);
+    const g = ajustes.get(n) || { nombre: n, patron: 'fijo', vel: 1, inten: 1, color: lista[0].color };
+    ajustes.set(n, g); g.idx = lista; return g;
+  });
+  const total = focos.length;
+  if (!total) return;
+  bulbs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.06, 10, 8), new THREE.MeshBasicMaterial(), total);
+  const posArr = new Float32Array(total * 3);
+  let k = 0;
+  grupos.forEach(g => g.idx.forEach(f => { f.k = k; bulbs.setMatrixAt(k, new THREE.Matrix4().setPosition(f.pos)); f.pos.toArray(posArr, k * 3); k++; }));
+  const hg = new THREE.BufferGeometry();
+  hg.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+  haloCol = new THREE.BufferAttribute(new Float32Array(total * 3), 3);
+  hg.setAttribute('aCol', haloCol);
+  halos = new THREE.Points(hg, haloMat); halos.frustumCulled = false;
+  fx.add(bulbs, halos);
+  const fuentes = total <= MAX_LUCES_REALES
+    ? grupos.flatMap(g => g.idx.map(f => ({ g, ds: [f] })))
+    : grupos.map(g => ({ g, ds: g.idx }));
+  fuentes.slice(0, MAX_LUCES_REALES).forEach(r => { r.L = new THREE.PointLight(0xffffff, 0, 16, 2); posReal(r); fx.add(r.L); reales.push(r); });
+}
+function seleccionar(f) {
+  sel = f;
+  if (f && edit.activo) { proxy.position.copy(f.pos); tc.attach(proxy); } else tc.detach();
+  leerSel();
+}
+function leerSel() {
+  campo.nombre = sel ? sel.nombre : '(toca un foco)';
+  if (sel) { campo.x = +sel.pos.x.toFixed(3); campo.y = +sel.pos.y.toFixed(3); campo.z = +sel.pos.z.toFixed(3); campo.grupo = sel.grupo; }
+  gui?.controllersRecursive().forEach(c => c.updateDisplay());
+}
+// tocar un foco (o hacer clic) lo selecciona: se elige el más cercano en pantalla
+let toque = null;
+const lienzo = renderer.domElement;
+lienzo.addEventListener('pointerdown', e => { toque = { x: e.clientX, y: e.clientY, t: performance.now() }; });
+lienzo.addEventListener('pointerup', e => {
+  if (!edit.activo || !toque || tc.axis) return;
+  if (Math.hypot(e.clientX - toque.x, e.clientY - toque.y) > 6 || performance.now() - toque.t > 450) return;
+  const R = lienzo.getBoundingClientRect(); let mejor = null, md = 40;
+  focos.forEach(f => {
+    const v = f.pos.clone().project(camera); if (v.z > 1) return;
+    const dd = Math.hypot((v.x * .5 + .5) * R.width + R.left - e.clientX, (-v.y * .5 + .5) * R.height + R.top - e.clientY);
+    if (dd < md) { md = dd; mejor = f; }
+  });
+  if (mejor) seleccionar(mejor);
+});
+let contN = 1;
+function nuevo(base) {
+  const grupo = base?.grupo || focos[0]?.grupo || 'nuevo';
+  const f = { nombre: `foco_${grupo}_n${contN++}`, grupo, color: base?.color || '#ffe2b0',
+    pos: base ? base.pos.clone().add(new THREE.Vector3(0.5, 0, 0)) : controls.target.clone().add(new THREE.Vector3(0, 1, 0)) };
+  edit.activo = true; focos.push(f); reconstruir(); armarGUI(); seleccionar(f); guardarBorrador();
+}
+const acc = {
+  agregar: () => nuevo(null),
+  duplicar: () => sel && nuevo(sel),
+  borrar: () => { if (!sel) return; focos.splice(focos.indexOf(sel), 1); reconstruir(); armarGUI(); guardarBorrador(); },
+  exportar: () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(datosGuardar(), null, 1)], { type: 'application/json' }));
+    a.download = 'luces.json'; a.click();
+  },
+  descartar: () => { try { localStorage.removeItem(LS); } catch {} location.reload(); }
+};
+function datosGuardar() {
+  return { version: 1,
+    focos: focos.map(f => ({ nombre: f.nombre, grupo: f.grupo, pos: f.pos.toArray().map(n => +n.toFixed(3)), color: f.color })),
+    grupos: Object.fromEntries([...ajustes].map(([n, g]) => [n, { patron: g.patron, vel: g.vel, inten: g.inten, color: g.color }])) };
+}
+function aplicarGuardado(sv) {
+  focos = sv.focos.map(f => ({ nombre: f.nombre, grupo: f.grupo, pos: new THREE.Vector3(...f.pos), color: f.color }));
+  Object.entries(sv.grupos || {}).forEach(([n, g]) => ajustes.set(n, { nombre: n, ...g }));
+}
+function guardarBorrador() {
+  if (!PUEDE_EDITAR) return;
+  try { localStorage.setItem(LS, JSON.stringify(datosGuardar())); } catch {}
+}
+function panelEdicion() {
+  const fe = gui.addFolder('Editar luces');
+  fe.add(edit, 'activo').name('Modo edición').onChange(v => seleccionar(v ? sel : null));
+  fe.add(campo, 'nombre').name('Foco').disable();
+  cXYZ = ['x', 'y', 'z'].map(k => fe.add(campo, k).name(k.toUpperCase()).step(0.05).onChange(() => {
+    if (!sel) return; sel.pos.set(campo.x, campo.y, campo.z); proxy.position.copy(sel.pos); refrescar(sel);
+  }).onFinishChange(guardarBorrador));
+  fe.add(campo, 'grupo').name('Grupo').onFinishChange(v => {
+    if (!sel || !v.trim()) return; sel.grupo = v.trim(); const s = sel;
+    setTimeout(() => { reconstruir(); armarGUI(); seleccionar(s); guardarBorrador(); });
+  });
+  fe.add(acc, 'agregar').name('Agregar foco');
+  fe.add(acc, 'duplicar').name('Duplicar seleccionado');
+  fe.add(acc, 'borrar').name('Borrar seleccionado');
+  fe.add(acc, 'exportar').name('Exportar luces.json');
+  fe.add(acc, 'descartar').name('Descartar cambios locales');
+}
+
 function armarGUI() {
   gui = new GUI({ title: 'Iluminación', width: Math.min(260, innerWidth - 24) });
+  gui.add(params, 'modo', ['noche', 'día', 'ciclo']).name('Modo').onChange(v => {
+    if (v === 'noche') params.hora = 0; if (v === 'día') params.hora = 15; aplicarLuna(); cHora.updateDisplay();
+  });
+  cHora = gui.add(params, 'hora', 0, 24, 0.05).name('Hora').onChange(aplicarLuna);
+  gui.add(params, 'duracion', 10, 300, 5).name('Duración ciclo (s)');
   gui.add(params, 'bloom', 0, 2, 0.05).name('Resplandor').onChange(v => bloom.strength = v);
   gui.add(params, 'halo', 0, 3, 0.05).name('Tamaño halo').onChange(v => haloMat.uniforms.uSize.value = v);
   gui.add(params, 'brillo', 0.5, 8, 0.1).name('Brillo focos');
-  gui.add(params, 'exposicion', 0.3, 2.5, 0.05).name('Exposición').onChange(v => renderer.toneMappingExposure = v);
-  gui.add(params, 'ambiente', 0, 1, 0.01).name('Luz ambiente').onChange(v => hemi.intensity = v);
+  gui.add(params, 'exposicion', 0.3, 2.5, 0.05).name('Exposición').onChange(aplicarLuna);
+  gui.add(params, 'ambiente', 0, 1, 0.01).name('Luz ambiente').onChange(aplicarLuna);
   const fl = gui.addFolder('Luna / sol');
-  fl.add(params, 'luna', 0, 6, 0.1).name('Intensidad').onChange(aplicarLuna);
-  fl.addColor(params, 'colorLuna').name('Color').onChange(aplicarLuna);
+  fl.add(params, 'luna', 0, 6, 0.1).name('Luna: intensidad').onChange(aplicarLuna);
+  fl.addColor(params, 'colorLuna').name('Luna: color').onChange(aplicarLuna);
   fl.add(params, 'azimut', -180, 180, 1).name('Dirección').onChange(aplicarLuna);
-  fl.add(params, 'elevacion', 5, 85, 1).name('Altura').onChange(aplicarLuna);
+  fl.add(params, 'elevacion', 5, 85, 1).name('Luna: altura').onChange(aplicarLuna);
   fl.add(params, 'sombras').name('Sombras').onChange(aplicarLuna);
   gui.add(params, 'calidad', Object.keys(CALIDAD)).name('Calidad').onChange(v => {
     params.autoCalidad = false; setRatio(CALIDAD[v]);
@@ -214,12 +324,13 @@ function armarGUI() {
   gui.add(params, 'bloomOn').name('Resplandor (bloom)').onChange(v => bloom.enabled = v);
   gui.add(params, 'lucesReales').name('Luz sobre fachada');
   gui.add(params, 'luzFachada', 0, 60, 0.5).name('Fuerza luz fachada');
+  if (PUEDE_EDITAR) panelEdicion();
   grupos.forEach(g => {
     const f = gui.addFolder(`${g.nombre} (${g.idx.length})`); f.close();
-    f.add(g, 'patron', PATRONES).name('Patrón');
-    f.addColor(g, 'color').name('Color');
-    f.add(g, 'inten', 0, 2, 0.05).name('Intensidad');
-    f.add(g, 'vel', 0.2, 4, 0.1).name('Velocidad');
+    f.add(g, 'patron', PATRONES).name('Patrón').onFinishChange(guardarBorrador);
+    f.addColor(g, 'color').name('Color').onFinishChange(guardarBorrador);
+    f.add(g, 'inten', 0, 2, 0.05).name('Intensidad').onFinishChange(guardarBorrador);
+    f.add(g, 'vel', 0.2, 4, 0.1).name('Velocidad').onFinishChange(guardarBorrador);
   });
   if (innerWidth < 700) gui.close();
 }
@@ -230,7 +341,7 @@ function animar(t) {
   grupos.forEach(g => {
     let suma = 0;
     g.idx.forEach((d, i) => {
-      const f = nivel(g, i, t) * g.inten;
+      const f = nivel(g, i, t) * g.inten * lampara;
       suma += f; d.f = f;
       if (g.patron === 'arcoiris') col.setHSL(((t * g.vel * 0.1 + i / g.idx.length) % 1), 1, 0.55);
       else col.set(g.color);
@@ -254,7 +365,7 @@ const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
 async function cargarURL(url) {
   msg('Cargando modelo…');
   const gltf = await loader.loadAsync(url);
-  usarModelo(gltf.scene);
+  usarModelo(gltf.scene, url === MODELO);
 }
 function casaDemo() {
   const g = new THREE.Group();
@@ -293,8 +404,10 @@ addEventListener('orientationchange', () => setTimeout(ajustar, 200));
 screen.orientation?.addEventListener?.('change', () => setTimeout(ajustar, 200));
 ajustar();
 
-let nf = 0, t0 = performance.now(), bajos = 0;
+let nf = 0, t0 = performance.now(), bajos = 0, tPrev = 0;
 renderer.setAnimationLoop(t => {
+  const dt = Math.min((t - tPrev) / 1000, 0.1); tPrev = t;
+  if (params.modo === 'ciclo') { params.hora = (params.hora + dt * 24 / params.duracion) % 24; aplicarLuna(); cHora?.updateDisplay(); }
   controls.update(); animar(t / 1000); composer.render();
   if (++nf === 60) {
     const ahora = performance.now(), fps = 60000 / (ahora - t0); nf = 0; t0 = ahora;
@@ -306,5 +419,7 @@ renderer.setAnimationLoop(t => {
   }
 });
 
+if (PUEDE_EDITAR) try { const d = localStorage.getItem(LS); if (d) GUARDADO = JSON.parse(d); } catch {}
+if (!GUARDADO) try { const rs = await fetch('./luces.json'); if (rs.ok) GUARDADO = await rs.json(); } catch {}
 try { await cargarURL(MODELO); }
 catch { usarModelo(casaDemo()); msg('Mostrando casa de ejemplo. Pon tu casa.glb junto a index.html o arrástralo aquí.'); }
