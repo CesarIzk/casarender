@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Casa con luces</title>
+<style>
+  html,body{margin:0;height:100%;height:100dvh;overscroll-behavior:none;-webkit-tap-highlight-color:transparent;background:#05070d;overflow:hidden;font-family:system-ui,sans-serif;color:#cfd6e4}
+  canvas{display:block;touch-action:none}
+  #msg{position:fixed;left:max(12px,env(safe-area-inset-left));bottom:max(12px,env(safe-area-inset-bottom));font-size:13px;opacity:.75;max-width:70vw;pointer-events:none}
+  #drop{position:fixed;inset:0;display:none;place-items:center;background:#000a;font-size:20px;z-index:5}
+  #pick{position:fixed;left:max(12px,env(safe-area-inset-left));top:max(12px,env(safe-area-inset-top));font-size:13px;background:#1b2233;color:#cfd6e4;border:1px solid #33405c;border-radius:8px;padding:8px 12px;cursor:pointer}
+  @media (max-width:700px){#msg{font-size:11px;max-width:55vw}#pick{padding:10px 14px;font-size:14px}}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"./vendor/three/build/three.module.js",
+  "three/addons/":"./vendor/three/examples/jsm/",
+  "lil-gui":"./vendor/lil-gui.esm.min.js"}}
+</script>
+</head>
+<body>
+<button id="pick">Abrir .glb</button>
+<input id="file" type="file" accept=".glb,.gltf" hidden>
+<div id="msg">Cargando…</div>
+<div id="drop">Suelta tu archivo .glb aquí</div>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
